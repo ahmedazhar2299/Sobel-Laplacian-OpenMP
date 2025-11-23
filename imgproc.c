@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <dirent.h>    
 #include <time.h>  
+#include <omp.h>
 
 double total_time_program;
 double total_time_laplacian;
@@ -117,54 +118,81 @@ void process_folder_to_pgm_then_run(char *input_dir, char *pgm_output_dir) {
     closedir(dir);
 }
 
-int TestReadImage(char *file_in, char *file_out)
-{
-    Image *image;
-    Image *laplacian, *sobel;
-    // Image *sobel, *histogram_global, *histogram_local;
-    // Image *gama_01, *gama_04, *gama_07, *gama_1;
-    char *stem = Extract_Filename_Stem(file_in);
-    image = ReadPNMImage(file_in);
+int TestReadImage(char *file_in, char *file_out) {
+    Image *image = ReadPNMImage(file_in);
+    if (!image) return 1;
+
     double start = now_seconds();
-    laplacian = Laplacian(image);
-    // sobel = Sobel(image);
+    Image *laplacian = Laplacian(image);
     double end = now_seconds();
+
+    // thread safe accumulation
+    #pragma omp atomic
     total_time_laplacian += (end - start);
 
-    // Please adjust the output filenames and paths to suit your needs:
+    char *stem = Extract_Filename_Stem(file_in);
     char filename[300];
-    snprintf(filename, sizeof(filename), "%s.pgm", stem);
+    snprintf(filename, sizeof(filename), "%s.pgm", stem ? stem : "out");
 
     SavePNMImage(laplacian, filename, "laplacian_pgm", "laplacian_png");
-    // SavePNMImage(sobel, filename, "sobel_pgm", "sobel_png");
-    free(stem);
-    return(0);
+
+    // free resources
+    if (stem) free(stem);
+    if (laplacian) {
+        free(laplacian->data);
+        free(laplacian);
+    }
+    if (image) {
+        free(image->data);
+        free(image);
+    }
+    return 0;
 }
 
 // Algorithms Code:
 Image *Laplacian(Image *image) {
-    unsigned char *tempin, *tempout;
-    int sum = 0;
-    Image *outimage;
-    outimage = CreateNewImage(image, (char*)"#testing function");
-    tempin = image->data;
-    tempout = outimage->data;
-    
-    for(int i = 0; i < image->Height; i++) {
-        for(int j = 0; j < image->Width; j++) {
-            sum = 0;
-            for(int m = -1; m <= 1; m += 2) {
-                for(int n = -1; n <= 1; n += 2) {
-                    sum += boundaryCheck(j + n, i + m, image->Width, image->Height) ? tempin[image->Width * (i + m) + (j + n)] : 0;
-                }
-            }
-            int temp = tempin[image->Width * i + j] * 4 - sum;
-            if(temp > 255) temp = 255;
-            if(temp < 0) temp = 0;
-            tempout[image->Width * i + j] = temp;
+    const int W = image->Width;
+    const int H = image->Height;
+
+    Image *outimage = CreateNewImage(image, (char*)"#Laplacian zero-pad omp");
+    unsigned char *restrict in  = image->data;
+    unsigned char *restrict out = outimage->data;
+
+    const int WP = W + 2;
+    const int HP = H + 2;
+    unsigned char *restrict pad = (unsigned char*)calloc((size_t)WP * HP, 1);
+    if (!pad) { fprintf(stderr, "OOM in Laplacian padding\n"); exit(1); }
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < H; ++i) {
+        unsigned char *dst = pad + (size_t)(i + 1) * WP + 1;
+        unsigned char *src = in  + (size_t)i * W;
+        memcpy(dst, src, (size_t)W);
+    }
+
+    // main kernel over original domain [1..H]x[1..W] in padded space
+    #pragma omp parallel for schedule(static)
+    for (int i = 1; i <= H; ++i) {
+        const unsigned char *restrict row_im1 = pad + (size_t)(i - 1) * WP;
+        const unsigned char *restrict row_i   = pad + (size_t)i       * WP;
+        const unsigned char *restrict row_ip1 = pad + (size_t)(i + 1) * WP;
+        unsigned char *restrict row_out = out + (size_t)(i - 1) * W;
+
+        // vectorizable inner loop
+        #pragma omp simd
+        for (int j = 1; j <= W; ++j) {
+            int sum = row_im1[j - 1] + row_im1[j + 1]
+                    + row_ip1[j - 1] + row_ip1[j + 1];
+
+            int val = ((int)row_i[j] << 1 << 1) - sum; 
+            if (val < 0) val = 0;
+            if (val > 255) val = 255;
+            row_out[j - 1] = (unsigned char)val;
         }
     }
-    return (outimage);
+
+    free(pad);
+    return outimage;
 }
 
 Image *Sobel(Image *image) {
