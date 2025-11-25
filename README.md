@@ -6,7 +6,7 @@
 brew install imagemagick libomp
 
 # Compile the image processing source code
-clang -O3 -std=c11 imgproc.c -o imgproc
+clang -std=c11 imgproc.c -o imgproc
 
 # Run the program
 ./imgproc
